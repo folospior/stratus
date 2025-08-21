@@ -1,5 +1,6 @@
 import exception
 import gleam/bit_array
+import gleam/bool
 import gleam/bytes_tree.{type BytesTree}
 import gleam/crypto
 import gleam/erlang/charlist
@@ -42,6 +43,11 @@ pub type SocketReason {
   NotOwner
   Badarg
   Posix(String)
+}
+
+pub type CustomCloseError {
+  SocketFail(SocketReason)
+  InvalidCode
 }
 
 fn convert_socket_reason(reason: socket.SocketReason) -> SocketReason {
@@ -683,62 +689,63 @@ pub fn close(conn: Connection) {
 }
 
 /// Status code: 1000
-pub fn close_reason_normal(body: BitArray) -> CloseReason {
-  SendNormal(body:)
+pub fn close_normal(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendNormal(body:))
 }
 
 /// Status code: 1001
-pub fn close_reason_going_away(body: BitArray) -> CloseReason {
-  SendGoingAway(body:)
+pub fn close_going_away(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendGoingAway(body:))
 }
 
 /// Status code: 1002
-pub fn close_reason_protocol_error(body: BitArray) -> CloseReason {
-  SendProtocolError(body:)
+pub fn close_protocol_error(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendProtocolError(body:))
 }
 
 /// Status code: 1003
-pub fn close_reason_unexpected_data_type(body: BitArray) -> CloseReason {
-  SendUnexpectedDataType(body:)
+pub fn close_unexpected_data_type(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendUnexpectedDataType(body:))
 }
 
 /// Status code: 1007
-pub fn close_reason_inconsistent_data_type(body: BitArray) -> CloseReason {
-  SendInconsistentDataType(body:)
+pub fn close_inconsistent_data_type(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendInconsistentDataType(body:))
 }
 
 /// Status code: 1008
-pub fn close_reason_policy_violation(body: BitArray) -> CloseReason {
-  SendPolicyViolation(body:)
+pub fn close_policy_violation(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendPolicyViolation(body:))
 }
 
 /// Status code: 1009
-pub fn close_reason_message_too_big(body: BitArray) -> CloseReason {
-  SendMessageTooBig(body:)
+pub fn close_message_too_big(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendMessageTooBig(body:))
 }
 
 /// Status code: 1010
-pub fn close_reason_missing_extensions(body: BitArray) -> CloseReason {
-  SendMissingExtensions(body:)
+pub fn close_missing_extensions(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendMissingExtensions(body:))
 }
 
 /// Status code: 1011
-pub fn close_reason_unexpected_condition(body: BitArray) -> CloseReason {
-  SendUnexpectedCondition(body:)
+pub fn close_unexpected_condition(conn: Connection, body: BitArray) {
+  close_with_reason(conn, SendUnexpectedCondition(body:))
 }
 
 /// Accepts codes from 0 to 4999.
-pub fn close_reason_custom(
+pub fn close_custom(
+  conn: Connection,
   code: Int,
   body: BitArray,
-) -> Result(CloseReason, Nil) {
-  case code >= 5000 {
-    True -> Error(Nil)
-    False -> Ok(SendCustomCloseReason(code:, body:))
-  }
+) -> Result(Nil, CustomCloseError) {
+  use <- bool.guard(when: code >= 5000, return: Error(InvalidCode))
+
+  close_with_reason(conn, SendCustomCloseReason(code:, body:))
+  |> result.map_error(SocketFail)
 }
 
-pub fn close_with_reason(
+fn close_with_reason(
   conn: Connection,
   reason: CloseReason,
 ) -> Result(Nil, SocketReason) {
