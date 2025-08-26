@@ -62,7 +62,7 @@ fn convert_socket_reason(reason: socket.SocketReason) -> SocketReason {
 fn from_socket_message(msg: SocketMessage) -> InternalMessage(user_message) {
   case msg {
     socket.Data(bits) -> Data(bits)
-    socket.Err(socket.Closed) -> Closed
+    socket.Err(socket.Closed) -> Closed(SocketFailed)
     socket.Err(reason) -> Err(convert_socket_reason(reason))
   }
 }
@@ -101,7 +101,7 @@ pub opaque type InternalMessage(user_message) {
   UserMessage(user_message)
   Err(SocketReason)
   Data(BitArray)
-  Closed
+  Closed(ReceivedCloseReason)
   Shutdown
 }
 
@@ -119,7 +119,7 @@ pub opaque type Builder(state, user_message) {
     init: fn() -> Result(Initialised(state, user_message), String),
     loop: fn(state, Message(user_message), Connection) ->
       Next(state, user_message),
-    on_close: fn(state) -> Nil,
+    on_close: fn(ReceivedCloseReason, state) -> Nil,
   )
 }
 
@@ -137,7 +137,7 @@ pub fn new(
     connect_timeout: 5000,
     init: fn() { Ok(initialised(state)) },
     loop: fn(state, _msg, _conn) { continue(state) },
-    on_close: fn(_state) { Nil },
+    on_close: fn(_close_reason, _state) { Nil },
   )
 }
 
@@ -165,7 +165,7 @@ pub fn new_with_initialiser(
     connect_timeout: 5000,
     init: init,
     loop: fn(state, _msg, _conn) { continue(state) },
-    on_close: fn(_state) { Nil },
+    on_close: fn(_close_reason, _state) { Nil },
   )
 }
 
@@ -196,7 +196,7 @@ pub fn with_connect_timeout(
 /// you will be in the loop with the state value handy.
 pub fn on_close(
   builder: Builder(state, user_message),
-  on_close: fn(state) -> Nil,
+  on_close: fn(ReceivedCloseReason, state) -> Nil,
 ) -> Builder(state, user_message) {
   Builder(..builder, on_close: on_close)
 }
@@ -418,9 +418,9 @@ pub fn start(
           }
         }
       }
-      Closed -> {
+      Closed(reason) -> {
         logging.log(logging.Debug, "Received closed frame")
-        builder.on_close(state.user_state)
+        builder.on_close(reason, state.user_state)
         close_contexts(state.compression)
         actor.stop()
       }
@@ -544,11 +544,13 @@ fn handle_frame(
       continue(state)
     }
     Control(CloseFrame(reason)) -> {
+      let reason = from_websocket_close_reason(reason)
+
       logging.log(
         logging.Debug,
         "WebSocket closing: " <> string.inspect(reason),
       )
-      builder.on_close(state.user_state)
+      builder.on_close(reason, state.user_state)
       NormalStop
     }
     Continuation(..) -> {
@@ -621,7 +623,22 @@ pub fn send_ping(conn: Connection, data: BitArray) -> Result(Nil, SocketReason) 
 }
 
 pub opaque type CloseReason {
+  SendNotProvided
+  SendNormal(body: BitArray)
+  SendGoingAway(body: BitArray)
+  SendProtocolError(body: BitArray)
+  SendUnexpectedDataType(body: BitArray)
+  SendInconsistentDataType(body: BitArray)
+  SendPolicyViolation(body: BitArray)
+  SendMessageTooBig(body: BitArray)
+  SendMissingExtensions(body: BitArray)
+  SendUnexpectedCondition(body: BitArray)
+  SendCustomCloseReason(code: Int, body: BitArray)
+}
+
+pub type ReceivedCloseReason {
   NotProvided
+  SocketFailed
   Normal(body: BitArray)
   GoingAway(body: BitArray)
   ProtocolError(body: BitArray)
@@ -634,70 +651,89 @@ pub opaque type CloseReason {
   CustomCloseReason(code: Int, body: BitArray)
 }
 
-fn convert_close_reason(reason: CloseReason) -> websocket.CloseReason {
+fn to_websocket_close_reason(reason: CloseReason) -> websocket.CloseReason {
   case reason {
-    NotProvided -> websocket.NotProvided
-    GoingAway(body:) -> websocket.GoingAway(body:)
-    InconsistentDataType(body:) -> websocket.InconsistentDataType(body:)
-    MessageTooBig(body:) -> websocket.MessageTooBig(body:)
-    MissingExtensions(body:) -> websocket.MissingExtensions(body:)
-    Normal(body:) -> websocket.Normal(body:)
-    PolicyViolation(body:) -> websocket.PolicyViolation(body:)
-    ProtocolError(body:) -> websocket.ProtocolError(body:)
-    UnexpectedCondition(body:) -> websocket.UnexpectedCondition(body:)
-    UnexpectedDataType(body:) -> websocket.UnexpectedDataType(body:)
-    CustomCloseReason(code:, body:) -> websocket.CustomCloseReason(code:, body:)
+    SendNotProvided -> websocket.NotProvided
+    SendGoingAway(body:) -> websocket.GoingAway(body:)
+    SendInconsistentDataType(body:) -> websocket.InconsistentDataType(body:)
+    SendMessageTooBig(body:) -> websocket.MessageTooBig(body:)
+    SendMissingExtensions(body:) -> websocket.MissingExtensions(body:)
+    SendNormal(body:) -> websocket.Normal(body:)
+    SendPolicyViolation(body:) -> websocket.PolicyViolation(body:)
+    SendProtocolError(body:) -> websocket.ProtocolError(body:)
+    SendUnexpectedCondition(body:) -> websocket.UnexpectedCondition(body:)
+    SendUnexpectedDataType(body:) -> websocket.UnexpectedDataType(body:)
+    SendCustomCloseReason(code:, body:) ->
+      websocket.CustomCloseReason(code:, body:)
+  }
+}
+
+fn from_websocket_close_reason(
+  reason: websocket.CloseReason,
+) -> ReceivedCloseReason {
+  case reason {
+    websocket.NotProvided -> NotProvided
+    websocket.GoingAway(body:) -> GoingAway(body:)
+    websocket.InconsistentDataType(body:) -> InconsistentDataType(body:)
+    websocket.MessageTooBig(body) -> MessageTooBig(body:)
+    websocket.MissingExtensions(body:) -> MissingExtensions(body:)
+    websocket.Normal(body:) -> Normal(body:)
+    websocket.PolicyViolation(body:) -> PolicyViolation(body:)
+    websocket.ProtocolError(body:) -> ProtocolError(body:)
+    websocket.UnexpectedCondition(body:) -> UnexpectedCondition(body:)
+    websocket.UnexpectedDataType(body:) -> UnexpectedDataType(body:)
+    websocket.CustomCloseReason(code:, body:) -> CustomCloseReason(code:, body:)
   }
 }
 
 /// Closes without a reason.
 pub fn close(conn: Connection) {
-  close_with_reason(conn, NotProvided)
+  close_with_reason(conn, SendNotProvided)
 }
 
 /// Status code: 1000
 pub fn close_normal(conn: Connection, body: BitArray) {
-  close_with_reason(conn, Normal(body:))
+  close_with_reason(conn, SendNormal(body:))
 }
 
 /// Status code: 1001
 pub fn close_going_away(conn: Connection, body: BitArray) {
-  close_with_reason(conn, GoingAway(body:))
+  close_with_reason(conn, SendGoingAway(body:))
 }
 
 /// Status code: 1002
 pub fn close_protocol_error(conn: Connection, body: BitArray) {
-  close_with_reason(conn, ProtocolError(body:))
+  close_with_reason(conn, SendProtocolError(body:))
 }
 
 /// Status code: 1003
 pub fn close_unexpected_data_type(conn: Connection, body: BitArray) {
-  close_with_reason(conn, UnexpectedDataType(body:))
+  close_with_reason(conn, SendUnexpectedDataType(body:))
 }
 
 /// Status code: 1007
 pub fn close_inconsistent_data_type(conn: Connection, body: BitArray) {
-  close_with_reason(conn, InconsistentDataType(body:))
+  close_with_reason(conn, SendInconsistentDataType(body:))
 }
 
 /// Status code: 1008
 pub fn close_policy_violation(conn: Connection, body: BitArray) {
-  close_with_reason(conn, PolicyViolation(body:))
+  close_with_reason(conn, SendPolicyViolation(body:))
 }
 
 /// Status code: 1009
 pub fn close_message_too_big(conn: Connection, body: BitArray) {
-  close_with_reason(conn, MessageTooBig(body:))
+  close_with_reason(conn, SendMessageTooBig(body:))
 }
 
 /// Status code: 1010
 pub fn close_missing_extensions(conn: Connection, body: BitArray) {
-  close_with_reason(conn, MissingExtensions(body:))
+  close_with_reason(conn, SendMissingExtensions(body:))
 }
 
 /// Status code: 1011
 pub fn close_unexpected_condition(conn: Connection, body: BitArray) {
-  close_with_reason(conn, UnexpectedCondition(body:))
+  close_with_reason(conn, SendUnexpectedCondition(body:))
 }
 
 /// Accepts codes from 0 to 4999.
@@ -708,7 +744,7 @@ pub fn close_custom(
 ) -> Result(Nil, CustomCloseError) {
   use <- bool.guard(when: code >= 5000, return: Error(InvalidCode))
 
-  close_with_reason(conn, CustomCloseReason(code:, body:))
+  close_with_reason(conn, SendCustomCloseReason(code:, body:))
   |> result.map_error(SocketFail)
 }
 
@@ -716,7 +752,7 @@ fn close_with_reason(
   conn: Connection,
   reason: CloseReason,
 ) -> Result(Nil, SocketReason) {
-  let reason = convert_close_reason(reason)
+  let reason = to_websocket_close_reason(reason)
   let mask = crypto.strong_random_bytes(4)
   let frame = websocket.encode_close_frame(reason, Some(mask))
 
